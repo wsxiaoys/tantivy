@@ -16,8 +16,8 @@ use super::agg_req::{Aggregation, AggregationVariants, Aggregations};
 use super::agg_result::{AggregationResult, BucketResult, MetricResult, RangeBucketEntry};
 use super::bucket::{
     composite_intermediate_key_ordering, cut_off_buckets, get_agg_name_and_property,
-    intermediate_histogram_buckets_to_final_buckets, CompositeAggregation, MissingOrder, Order,
-    OrderTarget, RangeAggregation, TermsAggregation,
+    intermediate_histogram_buckets_to_final_buckets, CompositeAggregation, GetDocCount,
+    MissingOrder, Order, OrderTarget, RangeAggregation, TermsAggregation,
 };
 use super::metric::{
     IntermediateAverage, IntermediateCount, IntermediateExtendedStats, IntermediateMax,
@@ -1000,29 +1000,6 @@ impl IntermediateTermBucketResult {
         limits: &mut AggregationLimitsGuard,
     ) -> crate::Result<BucketResult> {
         let req = TermsAggregationInternal::from_req(req);
-        let mut buckets: Vec<BucketEntry> = self
-            .entries
-            .into_iter()
-            .filter(|bucket| bucket.1.doc_count >= req.min_doc_count)
-            .map(|(key, entry)| {
-                let key_as_string = match key {
-                    IntermediateKey::Bool(key) => {
-                        let val = if key { "true" } else { "false" };
-                        Some(val.to_string())
-                    }
-                    _ => None,
-                };
-                Ok(BucketEntry {
-                    key_as_string,
-                    key: key.into(),
-                    doc_count: entry.doc_count,
-                    sub_aggregation: entry
-                        .sub_aggregation
-                        .into_final_result_internal(sub_aggregation_req, limits)?,
-                })
-            })
-            .collect::<crate::Result<_>>()?;
-
         let order = req.order.order;
         let size = req.size as usize;
         // Only the top `size` buckets are returned, and the merged result can hold
@@ -1032,39 +1009,80 @@ impl IntermediateTermBucketResult {
         // top-k set deterministic. `OrderTarget::SubAggregation` has no tie-break and relies on
         // the stable sort's input order, so it keeps the full sort.
         //
+        // For `OrderTarget::Key` and `OrderTarget::Count` the order is a total order over the raw
+        // `(doc_count, IntermediateKey)` pair, so the top-k is selected on the raw entries *before*
+        // they are converted into `BucketEntry` (which finalizes each bucket's sub-aggregation).
+        // Only the `size` survivors are materialized; the potentially far larger dropped tail is
+        // never converted. `OrderTarget::SubAggregation` orders on the finalized sub-aggregation
+        // value, so it still converts every entry.
+        //
         // We ignore _term_doc_count_before_cutoff here, because it increases the upperbound error
         // only for terms that didn't make it into the top N.
         //
         // This can be interesting, as a value of quality of the results, but not good to check the
         // actual error count for the returned terms.
-        let sum_other_doc_count = match req.order.target {
-            OrderTarget::Key => top_k_buckets(&mut buckets, size, |left, right| {
-                if req.order.order == Order::Asc {
-                    left.key.cmp(&right.key)
-                } else {
-                    right.key.cmp(&left.key)
-                }
-            }),
+        let (buckets, sum_other_doc_count) = match req.order.target {
+            OrderTarget::Key => {
+                let mut entries: Vec<(IntermediateKey, IntermediateTermBucketEntry)> = self
+                    .entries
+                    .into_iter()
+                    .filter(|(_, entry)| entry.doc_count >= req.min_doc_count)
+                    .collect();
+                let sum_other_doc_count = top_k_buckets(&mut entries, size, |left, right| {
+                    if order == Order::Asc {
+                        left.0.cmp(&right.0)
+                    } else {
+                        right.0.cmp(&left.0)
+                    }
+                });
+                let buckets = entries
+                    .into_iter()
+                    .map(|(key, entry)| into_bucket_entry(key, entry, sub_aggregation_req, limits))
+                    .collect::<crate::Result<Vec<_>>>()?;
+                (buckets, sum_other_doc_count)
+            }
             OrderTarget::Count => {
+                let mut entries: Vec<(IntermediateKey, IntermediateTermBucketEntry)> = self
+                    .entries
+                    .into_iter()
+                    .filter(|(_, entry)| entry.doc_count >= req.min_doc_count)
+                    .collect();
                 // Tie-break equal counts by key ascending so the output is deterministic
                 // regardless of the merge's (insertion-order) output.
-                let key_tie = |left: &BucketEntry, right: &BucketEntry| left.key.cmp(&right.key);
-                if req.order.order == Order::Desc {
-                    top_k_buckets(&mut buckets, size, |left, right| {
+                let key_tie =
+                    |left: &(IntermediateKey, IntermediateTermBucketEntry),
+                     right: &(IntermediateKey, IntermediateTermBucketEntry)| {
+                        left.0.cmp(&right.0)
+                    };
+                let sum_other_doc_count = if order == Order::Desc {
+                    top_k_buckets(&mut entries, size, |left, right| {
                         right
+                            .1
                             .doc_count
-                            .cmp(&left.doc_count)
+                            .cmp(&left.1.doc_count)
                             .then_with(|| key_tie(left, right))
                     })
                 } else {
-                    top_k_buckets(&mut buckets, size, |left, right| {
-                        left.doc_count
-                            .cmp(&right.doc_count)
+                    top_k_buckets(&mut entries, size, |left, right| {
+                        left.1
+                            .doc_count
+                            .cmp(&right.1.doc_count)
                             .then_with(|| key_tie(left, right))
                     })
-                }
+                };
+                let buckets = entries
+                    .into_iter()
+                    .map(|(key, entry)| into_bucket_entry(key, entry, sub_aggregation_req, limits))
+                    .collect::<crate::Result<Vec<_>>>()?;
+                (buckets, sum_other_doc_count)
             }
             OrderTarget::SubAggregation(name) => {
+                let mut buckets: Vec<BucketEntry> = self
+                    .entries
+                    .into_iter()
+                    .filter(|(_, entry)| entry.doc_count >= req.min_doc_count)
+                    .map(|(key, entry)| into_bucket_entry(key, entry, sub_aggregation_req, limits))
+                    .collect::<crate::Result<_>>()?;
                 let (agg_name, agg_property) = get_agg_name_and_property(&name);
                 let mut buckets_with_val = buckets
                     .into_iter()
@@ -1085,7 +1103,8 @@ impl IntermediateTermBucketResult {
                     .into_iter()
                     .map(|(bucket, _val)| bucket)
                     .collect_vec();
-                cut_off_buckets(&mut buckets, size, None).1
+                let sum_other_doc_count = cut_off_buckets(&mut buckets, size, None).1;
+                (buckets, sum_other_doc_count)
             }
         };
 
@@ -1213,19 +1232,50 @@ impl IntermediateTermBucketResult {
     }
 }
 
+/// Convert a selected raw term entry into its final `BucketEntry`, finalizing the entry's
+/// sub-aggregation.
+fn into_bucket_entry(
+    key: IntermediateKey,
+    entry: IntermediateTermBucketEntry,
+    sub_aggregation_req: &Aggregations,
+    limits: &mut AggregationLimitsGuard,
+) -> crate::Result<BucketEntry> {
+    let key_as_string = match key {
+        IntermediateKey::Bool(key) => {
+            let val = if key { "true" } else { "false" };
+            Some(val.to_string())
+        }
+        _ => None,
+    };
+    Ok(BucketEntry {
+        key_as_string,
+        key: key.into(),
+        doc_count: entry.doc_count,
+        sub_aggregation: entry
+            .sub_aggregation
+            .into_final_result_internal(sub_aggregation_req, limits)?,
+    })
+}
+
 /// Truncate `buckets` to the top `size` by `cmp`, sort the kept slice by `cmp`, and return the
 /// summed `doc_count` of the dropped tail.
 ///
 /// `cmp` must be a total order: `select_nth_unstable_by` leaves the top-k unordered, and only a
 /// total order makes the selected set deterministic.
-fn top_k_buckets<F>(buckets: &mut Vec<BucketEntry>, size: usize, cmp: F) -> u64
-where F: Fn(&BucketEntry, &BucketEntry) -> std::cmp::Ordering {
+fn top_k_buckets<T, F>(buckets: &mut Vec<T>, size: usize, cmp: F) -> u64
+where
+    T: GetDocCount,
+    F: Fn(&T, &T) -> std::cmp::Ordering,
+{
     if buckets.len() <= size {
         buckets.sort_unstable_by(&cmp);
         return 0;
     }
     buckets.select_nth_unstable_by(size, &cmp);
-    let sum_other_doc_count = buckets[size..].iter().map(|bucket| bucket.doc_count).sum();
+    let sum_other_doc_count = buckets[size..]
+        .iter()
+        .map(|bucket| bucket.doc_count())
+        .sum();
     buckets.truncate(size);
     buckets.sort_unstable_by(&cmp);
     sum_other_doc_count
@@ -2022,6 +2072,59 @@ mod tests {
             .entries
             .iter()
             .any(|(key, _)| key == &IntermediateKey::Str("b".to_string())));
+    }
+
+    #[test]
+    fn test_into_final_result_selects_top_k_on_raw_entries() {
+        use crate::aggregation::bucket::TermsAggregation;
+
+        // Raw entries in insertion order, with a doc_count tie at the cutoff ("c" and "d" both 7).
+        let entries: Vec<(IntermediateKey, IntermediateTermBucketEntry)> =
+            [("a", 5u64), ("b", 9), ("c", 7), ("d", 7), ("e", 1)]
+                .into_iter()
+                .map(|(key, doc_count)| {
+                    (
+                        IntermediateKey::Str(key.to_string()),
+                        IntermediateTermBucketEntry {
+                            doc_count,
+                            sub_aggregation: Default::default(),
+                        },
+                    )
+                })
+                .collect();
+
+        // `_count` desc, size 3: b(9) first, then the two 7s tie-broken by key ascending -> c, d.
+        let req: TermsAggregation =
+            serde_json::from_str(r#"{"field": "myfield", "size": 3, "order": {"_count": "desc"}}"#)
+                .unwrap();
+        let term_result = IntermediateTermBucketResult {
+            entries,
+            ..Default::default()
+        };
+        let result = term_result
+            .into_final_result(
+                &req,
+                &Default::default(),
+                &mut AggregationLimitsGuard::default(),
+            )
+            .unwrap();
+        let BucketResult::Terms {
+            buckets,
+            sum_other_doc_count,
+            ..
+        } = result
+        else {
+            panic!("expected terms");
+        };
+        assert_eq!(
+            buckets.iter().map(|b| b.key.clone()).collect::<Vec<_>>(),
+            [
+                Key::Str("b".to_string()),
+                Key::Str("c".to_string()),
+                Key::Str("d".to_string()),
+            ]
+        );
+        assert_eq!(sum_other_doc_count, 5 + 1);
     }
 
     #[test]
