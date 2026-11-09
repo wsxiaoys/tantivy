@@ -559,7 +559,7 @@ pub(crate) fn build_segment_term_collector(
         // map may be created once per parent bucket; when the parent is a near-unique id column
         // each of those maps holds a single term, so keep the first terms inline.
         if is_top_level {
-            let term_buckets = HashMapTermBuckets::<BucketId>::default();
+            let term_buckets = HashMapTermBuckets::<BucketId>::with_capacity_hint(num_terms);
             Ok(boxed_high_card_collector(
                 term_buckets,
                 sub_agg,
@@ -579,7 +579,7 @@ pub(crate) fn build_segment_term_collector(
         }
     } else {
         if is_top_level {
-            let term_buckets = HashMapTermBuckets::<()>::default();
+            let term_buckets = HashMapTermBuckets::<()>::with_capacity_hint(num_terms);
             Ok(boxed_high_card_collector(
                 term_buckets,
                 sub_agg,
@@ -684,6 +684,20 @@ pub(crate) trait TermAggregationMap<K: AggregationMapKey = u64>:
 pub(crate) struct HashMapTermBuckets<B = BucketId, K = u64> {
     bucket_map: FxHashMap<K, Bucket<B>>,
     key_heap_memory: usize,
+}
+
+/// Throwaway pre-check cap for E013 (unconditional top-level pre-size).
+const MAX_TERM_MAP_PRESIZE: usize = 8_000_000;
+
+impl<B, K> HashMapTermBuckets<B, K> {
+    #[inline]
+    fn with_capacity_hint(map_init_value: u64) -> Self {
+        let capacity = (map_init_value as usize).min(MAX_TERM_MAP_PRESIZE);
+        Self {
+            bucket_map: FxHashMap::with_capacity_and_hasher(capacity, Default::default()),
+            key_heap_memory: 0,
+        }
+    }
 }
 
 impl<B, K> Default for HashMapTermBuckets<B, K> {
