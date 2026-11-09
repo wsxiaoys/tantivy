@@ -200,6 +200,52 @@ fn test_small_blockwise_linear_example() {
     );
 }
 
+/// `BlockwiseLinearReader::get_range` decodes whole 512-value codec blocks; check the shapes the
+/// aggregation collector actually produces against `get_val`.
+#[test]
+fn test_blockwise_linear_get_range_shapes() {
+    // 1500 values => three codec blocks (512, 512, 476).
+    let vals: Vec<u64> = (0..1500u64).map(|i| 1_000 + i * 7 + (i % 13)).collect();
+    let mut stats_collector = StatsCollector::default();
+    let mut estimator = <BlockwiseLinearCodec as ColumnCodec>::Estimator::default();
+    for &val in &vals {
+        stats_collector.collect(val);
+        estimator.collect(val);
+    }
+    estimator.finalize();
+    let stats = stats_collector.stats();
+    let mut buffer = Vec::new();
+    estimator
+        .serialize(&stats, &mut vals.iter().copied(), &mut buffer)
+        .unwrap();
+    let reader = BlockwiseLinearCodec::load(OwnedBytes::new(buffer)).unwrap();
+
+    let check_range = |start: u64, len: usize| {
+        let mut out = vec![0u64; len];
+        reader.get_range(start, &mut out);
+        assert_eq!(
+            out,
+            vals[start as usize..start as usize + len],
+            "get_range({start}, {len})"
+        );
+        for (i, &val) in out.iter().enumerate() {
+            assert_eq!(val, reader.get_val(start as u32 + i as u32));
+        }
+    };
+    // Block-aligned start, mid-block start, a 64-value window (the collector's block size), a
+    // range crossing a 512 boundary, and length 1.
+    check_range(0, 512);
+    check_range(0, 64);
+    check_range(1, 64);
+    check_range(100, 64);
+    check_range(500, 64);
+    check_range(511, 3);
+    check_range(512, 64);
+    check_range(1023, 64);
+    check_range(1024, 476);
+    check_range(1499, 1);
+}
+
 proptest! {
     #![proptest_config(ProptestConfig::with_cases(10))]
 

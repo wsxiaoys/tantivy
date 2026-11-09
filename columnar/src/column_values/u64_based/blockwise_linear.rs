@@ -201,15 +201,12 @@ pub struct BlockwiseLinearReader {
     stats: ColumnStats,
 }
 
-impl ColumnValues for BlockwiseLinearReader {
+impl BlockwiseLinearReader {
+    /// Reconstructs the value at `idx_within_block` of `block` from the bitpacked residual
+    /// `bitpacked_diff`.
     #[inline(always)]
-    fn get_val(&self, idx: u32) -> u64 {
-        let block_id = (idx / BLOCK_SIZE) as usize;
-        let idx_within_block = idx % BLOCK_SIZE;
-        let block = &self.blocks[block_id];
+    fn reconstruct(&self, block: &Block, idx_within_block: u32, bitpacked_diff: u64) -> u64 {
         let interpoled_val: u64 = block.line.eval(idx_within_block);
-        let block_bytes = &self.data[block.data_start_offset..];
-        let bitpacked_diff = block.bit_unpacker.get(idx_within_block, block_bytes);
         // TODO optimize me! the line parameters could be tweaked to include the multiplication and
         // remove the dependency.
         self.stats.min_value
@@ -218,6 +215,51 @@ impl ColumnValues for BlockwiseLinearReader {
                 .gcd
                 .get()
                 .wrapping_mul(interpoled_val.wrapping_add(bitpacked_diff))
+    }
+}
+
+impl ColumnValues for BlockwiseLinearReader {
+    #[inline(always)]
+    fn get_val(&self, idx: u32) -> u64 {
+        let block_id = (idx / BLOCK_SIZE) as usize;
+        let idx_within_block = idx % BLOCK_SIZE;
+        let block = &self.blocks[block_id];
+        let block_bytes = &self.data[block.data_start_offset..];
+        let bitpacked_diff = block.bit_unpacker.get(idx_within_block, block_bytes);
+        self.reconstruct(block, idx_within_block, bitpacked_diff)
+    }
+
+    /// Fills `output` with the values `[start, start + output.len())`, decoding whole codec
+    /// blocks at once instead of one value at a time.
+    ///
+    /// The trait default gathers value-by-value; this override lets the bit unpacker decode a
+    /// full 512-value block with its amortized loads. The block payloads are stored back to back
+    /// (`data_start_offset`), so the slice handed to `BitUnpacker::get_range` spans the whole
+    /// remainder of the column and only the last (partial) block trips its end-of-data guard,
+    /// where it degrades to the per-value path (still correct, never slower).
+    fn get_range(&self, start: u64, output: &mut [u64]) {
+        debug_assert!(start <= u64::from(self.stats.num_rows));
+        debug_assert!(output.len() as u64 <= u64::from(self.stats.num_rows) - start);
+        let mut idx = start;
+        let mut remaining = output;
+        while !remaining.is_empty() {
+            let block_id = (idx / u64::from(BLOCK_SIZE)) as usize;
+            let idx_within_block = (idx % u64::from(BLOCK_SIZE)) as u32;
+            let block = &self.blocks[block_id];
+            let chunk_len = (BLOCK_SIZE - idx_within_block) as usize;
+            let chunk_len = chunk_len.min(remaining.len());
+            let (chunk, rest) = remaining.split_at_mut(chunk_len);
+            block.bit_unpacker.get_range(
+                idx_within_block,
+                &self.data[block.data_start_offset..],
+                chunk,
+            );
+            for (i, val) in chunk.iter_mut().enumerate() {
+                *val = self.reconstruct(block, idx_within_block + i as u32, *val);
+            }
+            idx += chunk_len as u64;
+            remaining = rest;
+        }
     }
 
     #[inline(always)]
