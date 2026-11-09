@@ -8,6 +8,7 @@ use crate::aggregation::agg_data::AggregationsSegmentCtx;
 use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateMetricResult,
 };
+use crate::aggregation::paged_vec::PagedVec;
 use crate::aggregation::segment_agg_result::SegmentAggregationCollector;
 use crate::aggregation::*;
 use crate::TantivyError;
@@ -221,7 +222,7 @@ fn create_collector<const TYPE_ID: u8>(
         missing_u64: req.missing_u64,
         column_opt,
         accessor: req.accessor,
-        buckets: vec![IntermediateStats::default()],
+        buckets: PagedVec::singleton(IntermediateStats::default()),
     })
 }
 
@@ -253,7 +254,10 @@ pub(crate) struct SegmentStatsCollector<const COLUMN_TYPE_ID: u8> {
     /// measurable.
     pub(crate) column_opt: Option<(Column<u64>, ColumnType)>,
     pub(crate) is_number_or_date_type: bool,
-    pub(crate) buckets: Vec<IntermediateStats>,
+    /// Per-bucket stats, indexed by [`BucketId`](crate::aggregation::BucketId). Paged because a
+    /// high-cardinality bucket agg grows this to millions of buckets; a plain `Vec` reallocates
+    /// (and copies) the whole buffer on the way there.
+    pub(crate) buckets: PagedVec<IntermediateStats, 12>,
     pub(crate) name: String,
     pub(crate) collecting_for: StatsType,
 }
@@ -353,7 +357,7 @@ impl<const COLUMN_TYPE_ID: u8> SegmentAggregationCollector
         let required_buckets = (max_bucket as usize) + 1;
         if self.buckets.len() < required_buckets {
             self.buckets
-                .resize_with(required_buckets, IntermediateStats::default);
+                .resize(required_buckets, IntermediateStats::default());
         }
         Ok(())
     }

@@ -25,6 +25,7 @@ use crate::aggregation::intermediate_agg_result::{
     IntermediateAggregationResult, IntermediateAggregationResults, IntermediateBucketResult,
     IntermediateKey, IntermediateTermBucketEntry, IntermediateTermBucketResult,
 };
+use crate::aggregation::paged_vec::PagedVec;
 use crate::aggregation::segment_agg_result::{BucketIdProvider, SegmentAggregationCollector};
 use crate::aggregation::{format_date, BucketId, Key, ValueSource};
 use crate::error::DataCorruption;
@@ -467,7 +468,7 @@ pub(crate) fn build_segment_term_collector(
             let term_buckets = VecTermBuckets::<BucketId>::new(num_terms, &mut bucket_id_provider);
             add_memory_consumption(&term_buckets, req_data)?;
             let collector: SegmentTermCollector<_, LowCardSubAggBuffer> = SegmentTermCollector {
-                parent_buckets: vec![term_buckets],
+                parent_buckets: PagedVec::singleton(term_buckets),
                 sub_agg: sub_agg_collector.map(LowCardBufferedSubAggs::new),
                 bucket_id_provider,
                 max_term_id: max_column_val,
@@ -609,7 +610,7 @@ fn boxed_high_card_collector<M: TermAggregationMap>(
     terms_req_data: TermsAggReqData,
 ) -> Box<dyn SegmentAggregationCollector> {
     Box::new(SegmentTermCollector::<M, HighCardSubAggBuffer> {
-        parent_buckets: vec![term_buckets],
+        parent_buckets: PagedVec::singleton(term_buckets),
         sub_agg,
         bucket_id_provider,
         max_term_id,
@@ -1139,8 +1140,12 @@ impl<B: BucketIdSlot> TermAggregationMap for LazyVecTermBuckets<B> {
 /// the correct datatype.
 #[derive(Debug)]
 struct SegmentTermCollector<TermMap: TermAggregationMap, B: SubAggBuffer> {
-    /// The buckets containing the aggregation data.
-    parent_buckets: Vec<TermMap>,
+    /// The buckets containing the aggregation data, indexed by [`BucketId`].
+    ///
+    /// Paged because a nested term agg grows this one `TermMap` per parent bucket (up to the
+    /// parent's bucket count); a plain `Vec` reallocates (and copies) the whole buffer on the way
+    /// there.
+    parent_buckets: PagedVec<TermMap, 8>,
     sub_agg: Option<BufferedSubAggs<B>>,
     bucket_id_provider: BucketIdProvider,
     max_term_id: u64,
