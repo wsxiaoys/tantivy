@@ -9,6 +9,7 @@ use columnar::{
 use common::{BitSet, TinySet};
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
+use smallvec::SmallVec;
 
 use super::{BucketIdSlot, CustomOrder, Order, OrderTarget};
 use crate::aggregation::agg_data::{
@@ -552,7 +553,9 @@ pub(crate) fn build_segment_term_collector(
             ))
         }
     } else if has_sub_aggregations {
-        let term_buckets = HashMapTermBuckets::<BucketId>::default();
+        // High cardinality, and possibly created once per parent bucket: keep the first terms
+        // inline so a bucket holding one term costs no allocation.
+        let term_buckets = SmallTermBuckets::<BucketId>::default();
         Ok(boxed_high_card_collector(
             term_buckets,
             sub_agg,
@@ -561,7 +564,7 @@ pub(crate) fn build_segment_term_collector(
             terms_req_data,
         ))
     } else {
-        let term_buckets = HashMapTermBuckets::<()>::default();
+        let term_buckets = SmallTermBuckets::<()>::default();
         Ok(boxed_high_card_collector(
             term_buckets,
             sub_agg,
@@ -831,6 +834,113 @@ impl<K: AggregationMapKey, B: BucketIdSlot> TermAggregationMap<K> for HashMapTer
 
     fn into_vec(self) -> Vec<(K, Bucket<B>)> {
         self.bucket_map.into_iter().collect()
+    }
+
+    #[inline]
+    fn new(_map_init_value: u64, _bucket_id_provider: &mut BucketIdProvider) -> Self {
+        Self::default()
+    }
+}
+
+/// Number of terms a [`SmallTermBuckets`] map holds inline before it promotes to a hash map.
+///
+/// A nested terms aggregation creates one map per parent bucket. When the parent has high
+/// cardinality (a near-unique id column, say), each of those maps holds a single term, and an
+/// `FxHashMap` allocates a table on its first insert: one allocation per parent bucket, 6.25M per
+/// split for ClickBench q33. Two inline slots cover that shape without touching the allocator.
+const SMALL_TERM_MAP_INLINE: usize = 2;
+
+/// A term map for buckets that hold only a handful of terms: entries live inline, and the map
+/// promotes to [`HashMapTermBuckets`]' storage once it grows past `SMALL_TERM_MAP_INLINE`, so a
+/// wide bucket costs what it did before.
+///
+/// The inline scan is linear, which is why the promotion threshold is small: past a couple of
+/// entries a hash lookup wins even for a map this size.
+#[derive(Clone, Debug)]
+pub(crate) struct SmallTermBuckets<B = BucketId, K = u64> {
+    repr: SmallTermBucketsRepr<B, K>,
+}
+
+#[derive(Clone, Debug)]
+enum SmallTermBucketsRepr<B, K> {
+    Inline(SmallVec<[(K, Bucket<B>); SMALL_TERM_MAP_INLINE]>),
+    Map(FxHashMap<K, Bucket<B>>),
+}
+
+impl<B, K> Default for SmallTermBuckets<B, K> {
+    #[inline]
+    fn default() -> Self {
+        Self {
+            repr: SmallTermBucketsRepr::Inline(SmallVec::new()),
+        }
+    }
+}
+
+impl<K: AggregationMapKey, B: BucketIdSlot> TermAggregationMap<K> for SmallTermBuckets<B, K> {
+    type Slot = B;
+
+    const SORTED_BY_KEY: bool = false;
+
+    #[inline]
+    fn get_memory_consumption(&self) -> usize {
+        match &self.repr {
+            SmallTermBucketsRepr::Inline(entries) => {
+                entries.capacity() * std::mem::size_of::<(K, Bucket<B>)>()
+            }
+            SmallTermBucketsRepr::Map(map) => map.memory_consumption(),
+        }
+    }
+
+    #[inline]
+    fn term_entry(&mut self, key: K, bucket_id_provider: &mut BucketIdProvider) -> B {
+        if let SmallTermBucketsRepr::Inline(entries) = &mut self.repr {
+            for (entry_key, bucket) in entries.iter_mut() {
+                if *entry_key == key {
+                    bucket.count += 1;
+                    return bucket.bucket_id;
+                }
+            }
+            if entries.len() < SMALL_TERM_MAP_INLINE {
+                let mut bucket = Bucket::<B>::new(bucket_id_provider);
+                bucket.count = 1;
+                entries.push((key, bucket));
+                return bucket.bucket_id;
+            }
+        }
+        // Either the inline slots are full (promote first) or the map is already a hash map.
+        if matches!(self.repr, SmallTermBucketsRepr::Inline(_)) {
+            let repr = std::mem::replace(
+                &mut self.repr,
+                SmallTermBucketsRepr::Map(FxHashMap::default()),
+            );
+            let SmallTermBucketsRepr::Inline(entries) = repr else {
+                unreachable!("checked above");
+            };
+            let mut map = FxHashMap::default();
+            map.reserve(2 * SMALL_TERM_MAP_INLINE);
+            for (entry_key, bucket) in entries {
+                map.insert(entry_key, bucket);
+            }
+            self.repr = SmallTermBucketsRepr::Map(map);
+        }
+        let SmallTermBucketsRepr::Map(map) = &mut self.repr else {
+            unreachable!("promoted above");
+        };
+        let bucket = match map.entry(key) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(Bucket::new(bucket_id_provider))
+            }
+        };
+        bucket.count += 1;
+        bucket.bucket_id
+    }
+
+    fn into_vec(self) -> Vec<(K, Bucket<B>)> {
+        match self.repr {
+            SmallTermBucketsRepr::Inline(entries) => entries.into_vec(),
+            SmallTermBucketsRepr::Map(map) => map.into_iter().collect(),
+        }
     }
 
     #[inline]
