@@ -139,6 +139,7 @@ mod date;
 mod error;
 pub mod intermediate_agg_result;
 pub mod metric;
+mod paged_vec;
 
 mod segment_agg_result;
 mod value_source;
