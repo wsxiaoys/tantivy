@@ -553,25 +553,49 @@ pub(crate) fn build_segment_term_collector(
             ))
         }
     } else if has_sub_aggregations {
-        // High cardinality, and possibly created once per parent bucket: keep the first terms
-        // inline so a bucket holding one term costs no allocation.
-        let term_buckets = SmallTermBuckets::<BucketId>::default();
-        Ok(boxed_high_card_collector(
-            term_buckets,
-            sub_agg,
-            bucket_id_provider,
-            max_column_val,
-            terms_req_data,
-        ))
+        // High cardinality. A top-level map holds the segment's whole term dictionary, which is
+        // never created once per parent bucket, so it keeps the plain hash map. A non-top-level
+        // map may be created once per parent bucket; when the parent is a near-unique id column
+        // each of those maps holds a single term, so keep the first terms inline.
+        if is_top_level {
+            let term_buckets = HashMapTermBuckets::<BucketId>::default();
+            Ok(boxed_high_card_collector(
+                term_buckets,
+                sub_agg,
+                bucket_id_provider,
+                max_column_val,
+                terms_req_data,
+            ))
+        } else {
+            let term_buckets = SmallTermBuckets::<BucketId>::default();
+            Ok(boxed_high_card_collector(
+                term_buckets,
+                sub_agg,
+                bucket_id_provider,
+                max_column_val,
+                terms_req_data,
+            ))
+        }
     } else {
-        let term_buckets = SmallTermBuckets::<()>::default();
-        Ok(boxed_high_card_collector(
-            term_buckets,
-            sub_agg,
-            bucket_id_provider,
-            max_column_val,
-            terms_req_data,
-        ))
+        if is_top_level {
+            let term_buckets = HashMapTermBuckets::<()>::default();
+            Ok(boxed_high_card_collector(
+                term_buckets,
+                sub_agg,
+                bucket_id_provider,
+                max_column_val,
+                terms_req_data,
+            ))
+        } else {
+            let term_buckets = SmallTermBuckets::<()>::default();
+            Ok(boxed_high_card_collector(
+                term_buckets,
+                sub_agg,
+                bucket_id_provider,
+                max_column_val,
+                terms_req_data,
+            ))
+        }
     }
 }
 
