@@ -473,10 +473,10 @@ fn permutation_and_subset_strategy(n: usize) -> impl Strategy<Value = Vec<usize>
     subsequence(vals, 0..=n).prop_shuffle()
 }
 
-fn build_columnar_with_mapping(
+fn serialize_columnar_with_mapping(
     docs: &[Vec<(&'static str, ColumnValue)>],
     old_to_new_row_ids_opt: Option<&[RowId]>,
-) -> ColumnarReader {
+) -> Vec<u8> {
     let num_docs = docs.len() as u32;
     let mut buffer = Vec::new();
     let mut columnar_writer = ColumnarWriter::default();
@@ -507,12 +507,67 @@ fn build_columnar_with_mapping(
     columnar_writer
         .serialize(num_docs, old_to_new_row_ids_opt, &mut buffer)
         .unwrap();
+    buffer
+}
 
-    ColumnarReader::open(buffer).unwrap()
+fn build_columnar_with_mapping(
+    docs: &[Vec<(&'static str, ColumnValue)>],
+    old_to_new_row_ids_opt: Option<&[RowId]>,
+) -> ColumnarReader {
+    ColumnarReader::open(serialize_columnar_with_mapping(
+        docs,
+        old_to_new_row_ids_opt,
+    ))
+    .unwrap()
 }
 
 fn build_columnar(docs: &[Vec<(&'static str, ColumnValue)>]) -> ColumnarReader {
     build_columnar_with_mapping(docs, None)
+}
+
+// Remapping documents must produce the exact same `.columnar` bytes as recording the
+// reordered documents without a mapping. Every document carries a value in every
+// column, so the cardinality does not depend on document order.
+#[test]
+fn test_columnar_remap_bytes_match_reordered_docs() {
+    let docs: Vec<Vec<(&'static str, ColumnValue)>> = vec![
+        vec![
+            ("c1", ColumnValue::Str("a")),
+            ("c2", ColumnValue::Numerical(1u64.into())),
+            ("c3", ColumnValue::Bool(true)),
+        ],
+        vec![
+            ("c1", ColumnValue::Str("b")),
+            ("c2", ColumnValue::Numerical(2u64.into())),
+            ("c3", ColumnValue::Bool(false)),
+        ],
+        vec![
+            ("c1", ColumnValue::Str("a")),
+            ("c2", ColumnValue::Numerical(3u64.into())),
+            ("c3", ColumnValue::Bool(true)),
+        ],
+        vec![
+            ("c1", ColumnValue::Str("c")),
+            ("c2", ColumnValue::Numerical(4u64.into())),
+            ("c3", ColumnValue::Bool(false)),
+        ],
+        vec![
+            ("c1", ColumnValue::Str("b")),
+            ("c2", ColumnValue::Numerical(5u64.into())),
+            ("c3", ColumnValue::Bool(true)),
+        ],
+    ];
+    // Non-trivial permutation (old -> new).
+    let old_to_new: Vec<RowId> = vec![3, 0, 4, 1, 2];
+    let mut reordered: Vec<Vec<(&'static str, ColumnValue)>> = vec![Vec::new(); docs.len()];
+    for (old, doc) in docs.iter().enumerate() {
+        reordered[old_to_new[old] as usize] = doc.clone();
+    }
+
+    assert_eq!(
+        serialize_columnar_with_mapping(&docs, Some(&old_to_new)),
+        serialize_columnar_with_mapping(&reordered, None)
+    );
 }
 
 fn assert_columnar_eq_strict(left: &ColumnarReader, right: &ColumnarReader) {
