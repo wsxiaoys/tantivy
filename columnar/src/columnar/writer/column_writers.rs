@@ -24,6 +24,94 @@ fn delta_with_last_doc(last_doc_opt: Option<u32>, doc: u32) -> DocumentStep {
     }
 }
 
+/// Iterator returned by [`ColumnWriter::operation_iterator`].
+///
+/// Either lazily deserializes operations from the scratch buffer, or yields the
+/// remapped document groups held in memory.
+enum ColumnOperationIterator<'a, V> {
+    Deserialize { cursor: &'a [u8] },
+    Remapped(RemappedColumnOperationIterator<V>),
+}
+
+impl<V: SymbolValue> Iterator for ColumnOperationIterator<'_, V> {
+    type Item = ColumnOperation<V>;
+
+    fn next(&mut self) -> Option<ColumnOperation<V>> {
+        match self {
+            ColumnOperationIterator::Deserialize { cursor } => {
+                ColumnOperation::<V>::deserialize(cursor)
+            }
+            ColumnOperationIterator::Remapped(remapped) => remapped.next(),
+        }
+    }
+}
+
+/// Holds a column's operations and yields them ordered by remapped document id.
+///
+/// `groups` holds one `(new_doc, value_start, value_end)` per document, sorted by
+/// `new_doc`; the range covers the document's values, excluding its original
+/// `NewDoc` operation (which is replaced by `NewDoc(new_doc)`).
+struct RemappedColumnOperationIterator<V> {
+    ops: Vec<ColumnOperation<V>>,
+    groups: Vec<(RowId, u32, u32)>,
+    group_idx: usize,
+    next_value: u32,
+    emit_new_doc: bool,
+}
+
+impl<V: SymbolValue> RemappedColumnOperationIterator<V> {
+    fn new(ops: Vec<ColumnOperation<V>>, old_to_new_ids: &[RowId]) -> Self {
+        let mut groups: Vec<(RowId, u32, u32)> = Vec::new();
+        let mut group_new_doc: Option<RowId> = None;
+        let mut group_value_start = 0u32;
+        for (op_idx, op) in ops.iter().enumerate() {
+            if let ColumnOperation::NewDoc(old_doc) = op {
+                let new_doc = old_to_new_ids[*old_doc as usize];
+                if let Some(previous_new_doc) = group_new_doc.replace(new_doc) {
+                    groups.push((previous_new_doc, group_value_start, op_idx as u32));
+                }
+                group_value_start = op_idx as u32 + 1;
+            }
+        }
+        if let Some(new_doc) = group_new_doc {
+            groups.push((new_doc, group_value_start, ops.len() as u32));
+        }
+        // `old_to_new_ids` is a permutation, so the sort keys are unique and an
+        // unstable sort yields the same order as the stable per-operation sort it
+        // replaces.
+        groups.sort_unstable_by_key(|(new_doc, _, _)| *new_doc);
+        RemappedColumnOperationIterator {
+            ops,
+            groups,
+            group_idx: 0,
+            next_value: 0,
+            emit_new_doc: true,
+        }
+    }
+}
+
+impl<V: SymbolValue> Iterator for RemappedColumnOperationIterator<V> {
+    type Item = ColumnOperation<V>;
+
+    fn next(&mut self) -> Option<ColumnOperation<V>> {
+        loop {
+            let (new_doc, value_start, value_end) = *self.groups.get(self.group_idx)?;
+            if self.emit_new_doc {
+                self.emit_new_doc = false;
+                self.next_value = value_start;
+                return Some(ColumnOperation::NewDoc(new_doc));
+            }
+            if self.next_value < value_end {
+                let op = self.ops[self.next_value as usize];
+                self.next_value += 1;
+                return Some(op);
+            }
+            self.group_idx += 1;
+            self.emit_new_doc = true;
+        }
+    }
+}
+
 #[derive(Copy, Clone, Default)]
 pub struct ColumnWriter {
     // Detected cardinality of the column so far.
@@ -38,7 +126,13 @@ pub struct ColumnWriter {
 impl ColumnWriter {
     /// Returns an iterator over the Symbol that have been recorded
     /// for the given column.
-    pub(super) fn operation_iterator<'a, V: SymbolValue>(
+    /// When `old_to_new_ids_opt` is `Some`, the operations are reordered so that the
+    /// documents appear in ascending new-doc order. `record` writes one `NewDoc`
+    /// followed by the document's values, so the operations of a document are
+    /// contiguous; and `old_to_new_ids` is a permutation. Remapping each document
+    /// group and sorting the groups therefore matches the per-operation stable sort
+    /// it replaces, without serializing and re-parsing every operation.
+    pub(super) fn operation_iterator<'a, V: SymbolValue + 'a>(
         &self,
         arena: &MemoryArena,
         old_to_new_ids_opt: Option<&[RowId]>,
@@ -46,28 +140,17 @@ impl ColumnWriter {
     ) -> impl Iterator<Item = ColumnOperation<V>> + 'a + use<'a, V> {
         buffer.clear();
         self.values.read_to_end(arena, buffer);
-        if let Some(old_to_new_ids) = old_to_new_ids_opt {
-            // TODO avoid the extra deserialization / serialization.
-            let mut sorted_ops: Vec<(RowId, ColumnOperation<V>)> = Vec::new();
-            let mut new_doc = 0u32;
-            let mut cursor = &buffer[..];
-            for op in std::iter::from_fn(|| ColumnOperation::<V>::deserialize(&mut cursor)) {
-                if let ColumnOperation::NewDoc(doc) = &op {
-                    new_doc = old_to_new_ids[*doc as usize];
-                    sorted_ops.push((new_doc, ColumnOperation::NewDoc(new_doc)));
-                } else {
-                    sorted_ops.push((new_doc, op));
-                }
-            }
-            // stable sort is crucial here.
-            sorted_ops.sort_by_key(|(new_doc_id, _)| *new_doc_id);
-            buffer.clear();
-            for (_, op) in sorted_ops {
-                buffer.extend_from_slice(op.serialize().as_ref());
-            }
-        }
+        let Some(old_to_new_ids) = old_to_new_ids_opt else {
+            return ColumnOperationIterator::Deserialize {
+                cursor: &buffer[..],
+            };
+        };
+        let mut ops: Vec<ColumnOperation<V>> = Vec::new();
         let mut cursor: &[u8] = &buffer[..];
-        std::iter::from_fn(move || ColumnOperation::deserialize(&mut cursor))
+        while let Some(op) = ColumnOperation::<V>::deserialize(&mut cursor) {
+            ops.push(op);
+        }
+        ColumnOperationIterator::Remapped(RemappedColumnOperationIterator::new(ops, old_to_new_ids))
     }
 
     /// Records a change of the document being recorded.
@@ -300,6 +383,85 @@ mod tests {
         assert_eq!(delta_with_last_doc(Some(1u32), 2u32), DocumentStep::Next);
         assert_eq!(delta_with_last_doc(Some(1u32), 3u32), DocumentStep::Skipped);
         assert_eq!(delta_with_last_doc(Some(1u32), 4u32), DocumentStep::Skipped);
+    }
+
+    fn numerical_column_ops(
+        docs: &[(RowId, Vec<NumericalValue>)],
+        old_to_new_ids: Option<&[RowId]>,
+    ) -> Vec<ColumnOperation<NumericalValue>> {
+        let mut arena = MemoryArena::default();
+        let mut column_writer = ColumnWriter::default();
+        for (doc, values) in docs {
+            for value in values {
+                column_writer.record(*doc, *value, &mut arena);
+            }
+        }
+        let mut buffer = Vec::new();
+        column_writer
+            .operation_iterator::<NumericalValue>(&arena, old_to_new_ids, &mut buffer)
+            .collect()
+    }
+
+    /// The remapping performed before the document-group rewrite: one `(new_doc,
+    /// op)` entry per operation, stable-sorted by new doc id.
+    fn per_operation_remap<V: SymbolValue>(
+        ops: &[ColumnOperation<V>],
+        old_to_new_ids: &[RowId],
+    ) -> Vec<ColumnOperation<V>> {
+        let mut sorted_ops: Vec<(RowId, ColumnOperation<V>)> = Vec::new();
+        let mut new_doc = 0u32;
+        for op in ops {
+            if let ColumnOperation::NewDoc(doc) = op {
+                new_doc = old_to_new_ids[*doc as usize];
+                sorted_ops.push((new_doc, ColumnOperation::NewDoc(new_doc)));
+            } else {
+                sorted_ops.push((new_doc, *op));
+            }
+        }
+        sorted_ops.sort_by_key(|(new_doc_id, _)| *new_doc_id);
+        sorted_ops.into_iter().map(|(_, op)| op).collect()
+    }
+
+    #[test]
+    fn test_operation_iterator_remap_groups_documents() {
+        // Doc 0 is multivalued, doc 1 single-valued, doc 2 absent, doc 4 single-valued.
+        let docs: Vec<(RowId, Vec<NumericalValue>)> = vec![
+            (0, vec![NumericalValue::I64(10), NumericalValue::I64(11)]),
+            (1, vec![NumericalValue::I64(20)]),
+            (4, vec![NumericalValue::I64(40)]),
+        ];
+        // Non-trivial permutation over 5 documents (old -> new).
+        let old_to_new_ids: Vec<RowId> = vec![3, 0, 4, 2, 1];
+
+        let remapped = numerical_column_ops(&docs, Some(&old_to_new_ids));
+        assert_eq!(
+            remapped,
+            vec![
+                ColumnOperation::NewDoc(0),
+                ColumnOperation::Value(NumericalValue::I64(20)),
+                ColumnOperation::NewDoc(1),
+                ColumnOperation::Value(NumericalValue::I64(40)),
+                ColumnOperation::NewDoc(3),
+                ColumnOperation::Value(NumericalValue::I64(10)),
+                ColumnOperation::Value(NumericalValue::I64(11)),
+            ]
+        );
+
+        // Equivalent to the previous per-operation stable sort.
+        let original = numerical_column_ops(&docs, None);
+        assert_eq!(remapped, per_operation_remap(&original, &old_to_new_ids));
+    }
+
+    #[test]
+    fn test_operation_iterator_remap_identity_and_empty() {
+        let docs: Vec<(RowId, Vec<NumericalValue>)> = vec![(0, vec![NumericalValue::U64(1)])];
+        // An identity mapping keeps the operation stream unchanged.
+        assert_eq!(
+            numerical_column_ops(&docs, Some(&[0])),
+            numerical_column_ops(&docs, None)
+        );
+        // A column with no recorded value yields no operation.
+        assert!(numerical_column_ops(&[], Some(&[0, 1])).is_empty());
     }
 
     #[track_caller]
